@@ -264,11 +264,69 @@ function defaults(){
   return {members:[], meId:null, expenses:[], personal:[], budget:0,
           rate:{value:9.5, updated:null, source:'default'}};
 }
+/* ---------- 저장 데이터 검사 (앱 시작·백업 불러오기 때) ----------
+   앱이 직접 만든 모양의 값만 통과시키고, 나머지는 버려요.
+   백업 텍스트는 남이 보낸 것일 수 있으니 '믿을 수 없는 입력'으로 다뤄요. */
+// uid()가 만드는 id는 영문 소문자+숫자뿐이라, 다른 글자(<, ", 공백 등)가 있으면 버림
+const isId  = v => typeof v === 'string' && /^[a-z0-9]{1,32}$/.test(v);
+const isAmt = v => typeof v === 'number' && isFinite(v) && v >= 0 && v < 1e12;
+const isCur = v => v === 'JPY' || v === 'KRW';
+const cut   = (v, max) => typeof v === 'string' ? v.trim().slice(0, max) : '';
+// id 배열 정리: 형식이 맞고(ok가 있으면 그 안에 있는) id만, 중복 없이
+const idList = (arr, ok) => Array.isArray(arr) ? [...new Set(arr.filter(x => isId(x) && (!ok || ok.has(x))))] : [];
+
+function cleanData(d){
+  if(!d || typeof d !== 'object' || !Array.isArray(d.members) || !Array.isArray(d.expenses)) throw new Error('bad format');
+  const out = defaults(), mem = new Set();
+
+  d.members.forEach(m => {
+    const n = m && cut(m.name, 12);
+    if(!m || !isId(m.id) || mem.has(m.id) || !n) return;
+    mem.add(m.id); out.members.push({id:m.id, name:n});
+  });
+  out.meId = mem.has(d.meId) ? d.meId : null;
+
+  d.expenses.forEach(e => {
+    if(!e || !isId(e.id) || !isAmt(e.amount) || !(e.amount > 0) || !isCur(e.cur) || !mem.has(e.payer)) return;
+    const x = {id:e.id, title:cut(e.title, 30) || '지출', amount:e.amount, cur:e.cur, payer:e.payer,
+               parts:idList(e.parts, mem), photos:idList(e.photos).slice(0, 6),
+               ts:Number.isFinite(e.ts) ? e.ts : Date.now()};
+    // 메뉴별로 나눈 지출이면 사람별 금액(shares)과 메뉴 목록도 검사
+    if(e.shares && typeof e.shares === 'object' && Array.isArray(e.items)){
+      x.shares = {};
+      Object.keys(e.shares).forEach(id => { if(mem.has(id) && isAmt(e.shares[id])) x.shares[id] = e.shares[id]; });
+      x.items = e.items.filter(it => it && isAmt(it.price))
+        .map(it => ({name:cut(it.name, 24) || '메뉴', price:it.price, eaters:idList(it.eaters, mem)}));
+      x.pct = isAmt(e.pct) && e.pct <= 100 ? e.pct : 0;
+      x.parts = Object.keys(x.shares).filter(id => x.shares[id] > 0);
+    }
+    if(x.parts.length) out.expenses.push(x);   // 나눌 사람이 없으면 계산이 깨지므로 버림
+  });
+
+  if(Array.isArray(d.personal)) d.personal.forEach(p => {
+    if(!p || !isId(p.id) || !isAmt(p.amount) || !(p.amount > 0) || !isCur(p.cur)) return;
+    out.personal.push({id:p.id, title:cut(p.title, 30) || '지출', amount:p.amount, cur:p.cur,
+                       cat:CATS.includes(p.cat) ? p.cat : '기타', ts:Number.isFinite(p.ts) ? p.ts : Date.now()});
+  });
+
+  out.budget = isAmt(d.budget) ? d.budget : 0;
+  const r = d.rate;
+  if(r && typeof r.value === 'number' && r.value > 0 && r.value < 100 && ['auto','manual','default'].includes(r.source)){
+    out.rate = {value:r.value, source:r.source,
+                updated:typeof r.updated === 'string' && !isNaN(Date.parse(r.updated)) ? r.updated : null};
+  }
+  return out;
+}
+
 function load(){
+  let raw = null;
   try{
-    const raw = localStorage.getItem(KEY);
-    if(raw) return Object.assign(defaults(), JSON.parse(raw));
-  }catch(e){}
+    raw = localStorage.getItem(KEY);
+    if(raw) return cleanData(JSON.parse(raw));
+  }catch(e){
+    // 읽지 못한 데이터는 지우지 않고 따로 보관 (다음 저장 때 덮어써서 잃어버리지 않게)
+    try{ if(raw) localStorage.setItem(KEY + ':broken', raw); }catch(err){}
+  }
   return defaults();
 }
 let S = load();
@@ -544,7 +602,7 @@ function formInner(){
   const m = S.members, editing = !!F.id, items = F.mode === 'items';
   if(!m.some(x => x.id === F.payer)) F.payer = (S.meId && m.some(x => x.id === S.meId)) ? S.meId : m[0].id;
   const chips = (sel, act, extra, cls) => m.map(x =>
-    `<button class="chip${cls || ''}${sel(x.id) ? ' on' : ''}" data-act="${act}" data-id="${x.id}" ${extra || ''} aria-pressed="${sel(x.id)}">${esc(x.name)}</button>`).join('');
+    `<button class="chip${cls || ''}${sel(x.id) ? ' on' : ''}" data-act="${act}" data-id="${esc(x.id)}" ${extra || ''} aria-pressed="${sel(x.id)}">${esc(x.name)}</button>`).join('');
   let h = `<div class="between" style="margin-bottom:8px"><h2 style="margin:0">${editing ? '지출 수정' : '지출 추가'}</h2>${editing ? '<button class="link" data-act="cancelEdit">수정 취소</button>' : ''}</div><div class="box">`;
   h += `<input class="in" data-f="title" placeholder="내용 (예: 이자카야 저녁)" maxlength="30" autocomplete="off" value="${esc(F.title)}">`;
   h += `<div class="seg full mt" role="group" aria-label="나누는 방식">
@@ -556,7 +614,7 @@ function formInner(){
     h += `<div class="between mt"><span class="meta">메뉴 가격의 통화</span>${seg('expCur', F.cur)}</div>`;
   }
   h += `<label class="lbl" for="expPayer">결제한 사람</label>
-    <select id="expPayer" class="in" data-f="payer">${m.map(x => `<option value="${x.id}"${x.id === F.payer ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select>`;
+    <select id="expPayer" class="in" data-f="payer">${m.map(x => `<option value="${esc(x.id)}"${x.id === F.payer ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select>`;
   if(!items){
     h += `<div class="lbl between"><span>나눌 사람</span><button class="link" data-act="splitAll">전원 선택</button></div>
       <div class="chips" id="splitChips">${chips(id => F.parts.has(id), 'split')}</div>`;
@@ -574,8 +632,8 @@ function formInner(){
       <div class="sumbox" id="itemSum">${sumHTML()}</div>`;
   }
   h += `<div class="lbl">영수증 사진 <span class="count">참고용</span></div>
-    <div class="thumbs">${F.photos.map(id => `<div class="tw"><img class="thumb" data-pid="${id}" data-id="${id}" data-act="viewPhoto" alt="영수증 사진">
-      <button class="del" data-act="rmPhoto" data-id="${id}" aria-label="사진 지우기">×</button></div>`).join('')}
+    <div class="thumbs">${F.photos.map(id => `<div class="tw"><img class="thumb" data-pid="${esc(id)}" data-id="${esc(id)}" data-act="viewPhoto" alt="영수증 사진">
+      <button class="del" data-act="rmPhoto" data-id="${esc(id)}" aria-label="사진 지우기">×</button></div>`).join('')}
       ${F.photos.length < 6 ? '<button class="addph" data-act="pickPhoto">+ 사진</button>' : ''}</div>
     <input type="file" id="photoIn" class="vh" accept="image/*" multiple tabindex="-1" aria-hidden="true">
     <p class="hint">카메라로 찍거나 앨범에서 고를 수 있어요. 사진은 이 폰에만 저장되고, 데이터 백업에는 들어가지 않아요.</p>`;
@@ -584,28 +642,28 @@ function formInner(){
 }
 function expRowHTML(e){
   const photos = e.photos && e.photos.length
-    ? `<div class="thumbs">${e.photos.map(id => `<img class="thumb" data-pid="${id}" data-id="${id}" data-act="viewPhoto" alt="영수증 사진">`).join('')}</div>` : '';
+    ? `<div class="thumbs">${e.photos.map(id => `<img class="thumb" data-pid="${esc(id)}" data-id="${esc(id)}" data-act="viewPhoto" alt="영수증 사진">`).join('')}</div>` : '';
   const detail = e.items
     ? `<details class="mini"><summary>메뉴 ${e.items.length}개 보기</summary>${e.items.map(it =>
         `<div class="r-row"><span>${esc(it.name)} ${money(it.price, e.cur)}</span><span>${it.eaters.map(id => esc(name(id))).join(', ')}</span></div>`).join('')}
-        ${e.pct > 0 ? `<div class="meta">봉사료·세금 ${e.pct}% 포함</div>` : ''}</details>` : '';
+        ${e.pct > 0 ? `<div class="meta">봉사료·세금 ${esc(e.pct)}% 포함</div>` : ''}</details>` : '';
   return `<div class="item exp${F.id === e.id ? ' editing' : ''}"><div class="grow"><div>${esc(e.title)}</div>
     <div class="meta">${esc(name(e.payer))} 결제, ${e.items ? '메뉴별로 나눔' : e.parts.length + '명이 나눔'}</div>${detail}${photos}</div>
     <div class="acts"><span class="num">${money(e.amount, e.cur)}</span>
-      <div class="btns"><button class="edit" data-act="editExp" data-id="${e.id}">수정</button>
-      <button class="del" data-act="rmExp" data-id="${e.id}" aria-label="${esc(e.title)} 지우기">×</button></div></div></div>`;
+      <div class="btns"><button class="edit" data-act="editExp" data-id="${esc(e.id)}">수정</button>
+      <button class="del" data-act="rmExp" data-id="${esc(e.id)}" aria-label="${esc(e.title)} 지우기">×</button></div></div></div>`;
 }
 function settleHTML(){
   const m = S.members;
   let h = `<section class="sec"><h2>같이 가는 사람</h2><div class="box">`;
   h += m.length
-    ? `<div class="chips">${m.map(x => `<span class="chip">${esc(x.name)}${x.id===S.meId?' <b class="me">나</b>':''}<button class="x" data-act="rmMember" data-id="${x.id}" aria-label="${esc(x.name)} 빼기">×</button></span>`).join('')}</div>`
+    ? `<div class="chips">${m.map(x => `<span class="chip">${esc(x.name)}${x.id===S.meId?' <b class="me">나</b>':''}<button class="x" data-act="rmMember" data-id="${esc(x.id)}" aria-label="${esc(x.name)} 빼기">×</button></span>`).join('')}</div>`
     : `<p class="hint" style="margin-top:0">이름을 추가하면 지출을 나눌 수 있어요.</p>`;
   h += `<div class="row mt"><input id="memName" class="in grow" placeholder="이름" maxlength="12" enterkeyhint="done" autocomplete="off">
         <button class="btn sm" data-act="addMember">추가</button></div>`;
   if(m.length){
     h += `<label class="lbl" for="meSel">이 중에 나는</label>
-      <select id="meSel" class="in"><option value="">고르지 않음</option>${m.map(x => `<option value="${x.id}"${x.id===S.meId?' selected':''}>${esc(x.name)}</option>`).join('')}</select>
+      <select id="meSel" class="in"><option value="">고르지 않음</option>${m.map(x => `<option value="${esc(x.id)}"${x.id===S.meId?' selected':''}>${esc(x.name)}</option>`).join('')}</select>
       <p class="hint">고르면 예산 탭에 같이 쓴 돈 중 내 몫이 들어가요.</p>`;
   }
   h += `</div></section>`;
@@ -667,7 +725,7 @@ function budgetHTML(){
   if(rows.length){
     const max = Math.max(...rows.map(r => r[1]));
     h += `<section class="sec"><h2>어디에 썼는지</h2><div class="box list">
-      ${rows.map(([c,v]) => `<div class="item" style="display:block"><div class="between"><span>${c}</span><span class="num">${fmtW(v)}</span></div>
+      ${rows.map(([c,v]) => `<div class="item" style="display:block"><div class="between"><span>${esc(c)}</span><span class="num">${fmtW(v)}</span></div>
         <div class="cat-bar"><i style="width:${v/max*100}%"></i></div></div>`).join('')}
     </div>${!S.meId && S.expenses.length ? '<p class="hint">정산 탭에서 나를 고르면 같이 쓴 돈도 여기에 들어가요.</p>' : ''}</section>`;
   } else if(!S.meId && S.expenses.length){
@@ -684,9 +742,9 @@ function budgetHTML(){
 
   if(S.personal.length){
     h += `<section class="sec"><h2>내 지출 내역 <span class="count">${S.personal.length}건</span></h2><div class="box list">
-      ${S.personal.slice().reverse().map(p => `<div class="item"><div class="grow"><div>${esc(p.title)}</div><div class="meta">${p.cat}</div></div>
+      ${S.personal.slice().reverse().map(p => `<div class="item"><div class="grow"><div>${esc(p.title)}</div><div class="meta">${esc(p.cat)}</div></div>
         <div class="right"><span class="num">${money(p.amount, p.cur)}</span>
-        <button class="del" data-act="rmPer" data-id="${p.id}" aria-label="${esc(p.title)} 지우기">×</button></div></div>`).join('')}
+        <button class="del" data-act="rmPer" data-id="${esc(p.id)}" aria-label="${esc(p.title)} 지우기">×</button></div></div>`).join('')}
     </div></section>`;
   }
   return h;
@@ -935,13 +993,17 @@ const A = {
   importData(){
     const raw = $('#importTxt').value.trim();
     if(!raw){ toast('백업 내용을 붙여넣으세요.'); return; }
-    try{
-      const d = JSON.parse(raw);
-      if(!Array.isArray(d.members) || !Array.isArray(d.expenses)) throw 0;
-      if(!confirm('지금 데이터를 백업 내용으로 바꿀까요?')) return;
-      discardForm(); S = Object.assign(defaults(), d); F = newForm(); cleanPhotos();
-      save(); render(); toast('백업을 불러왔어요.');
-    }catch(e){ toast('백업 형식이 아니에요. 복사한 내용을 그대로 붙여넣으세요.'); }
+    if(raw.length > 1000000){ toast('백업 내용이 너무 길어요.'); return; }
+    let d, c;
+    try{ d = JSON.parse(raw); c = cleanData(d); }
+    catch(e){ toast('백업 형식이 아니에요. 복사한 내용을 그대로 붙여넣으세요.'); return; }
+    if(!confirm('지금 데이터를 백업 내용으로 바꿀까요?')) return;
+    // 형식이 맞지 않아 버린 항목 수 (사람 + 지출 + 내 지출)
+    const dropped = (d.members.length - c.members.length) + (d.expenses.length - c.expenses.length)
+                  + ((Array.isArray(d.personal) ? d.personal.length : 0) - c.personal.length);
+    discardForm(); S = c; F = newForm(); cleanPhotos();
+    save(); render();
+    toast(dropped > 0 ? `백업을 불러왔어요. 형식이 맞지 않는 ${dropped}개 항목은 뺐어요.` : '백업을 불러왔어요.');
   },
   resetAll(){
     if(!confirm('사람, 지출, 예산을 모두 지울까요? 되돌릴 수 없어요.')) return;
