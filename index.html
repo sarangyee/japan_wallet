@@ -194,6 +194,26 @@ details.mini summary{font-size:13px;color:var(--link);cursor:pointer;padding:2px
   opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;max-width:calc(100% - 32px);z-index:40}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
+/* 환율 그래프 */
+:root{--down:#2468C8}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--down:#7FB2FF}}
+:root[data-theme="dark"]{--down:#7FB2FF}
+.chart{width:100%;height:auto;display:block;margin-top:12px}
+.chart .ln{fill:none;stroke:var(--accent);stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round}
+.chart .ar{fill:var(--tint)}
+.chart .gd{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
+.chart text{font-size:11px;fill:var(--muted)}
+.chart .dot{fill:var(--accent);stroke:var(--paper);stroke-width:2}
+.up{color:var(--red)}.down{color:var(--down)}
+/* 주간 등락표·변동 요약 */
+.wk-r{text-align:right;flex:none}
+/* 링크를 버튼 모양으로 */
+a.btn{display:block;text-align:center;text-decoration:none;font-size:15px}
+a.btn:focus-visible{outline:3px solid var(--link);outline-offset:2px}
+.pos-bar{position:relative;height:8px;border-radius:4px;margin:14px 7px 6px;
+  background:linear-gradient(90deg,var(--down),var(--line),var(--red))}
+.pos-bar i{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;
+  background:var(--paper);border:3px solid var(--ink);transform:translate(-50%,-50%)}
 </style>
 </head>
 <body>
@@ -771,6 +791,13 @@ function fxHTML(){
       <button class="btn sm ghost" data-act="fxDir" aria-label="계산 방향 바꾸기">${fxDir==='J2K'?'엔 → 원':'원 → 엔'}</button></div>
       <div class="fx-out num" id="fxOut" aria-live="polite">—</div>
     </div></section>
+    <section class="sec"><h2>환율 흐름</h2><div class="box" id="chartBox">${chartInner()}</div></section>
+    <section class="sec"><h2>주간 등락 <span class="count">최근 4주, 100엔당</span></h2><div class="box list" id="weekBox">${weekInner()}</div></section>
+    <section class="sec"><h2>변동 요약</h2><div class="box" id="volBox">${volInner()}</div></section>
+    <section class="sec"><h2>관련 뉴스</h2><div class="box">
+      <a class="btn ghost" href="${NEWS_URL}" target="_blank" rel="noopener noreferrer">엔화 환율 뉴스 보기</a>
+      <p class="hint">구글 뉴스의 '엔화 환율' 검색 결과가 새 창으로 열려요.</p>
+    </div></section>
     <section class="sec"><h2>자주 보는 가격</h2><div class="box list">
       ${[100,500,1000,3000,5000,10000].map(y => `<div class="item"><span class="num">${fmtY(y)}</span><span class="num">${fmtW(y*S.rate.value)}</span></div>`).join('')}
     </div></section>`;
@@ -810,6 +837,197 @@ async function refreshRate(silent){
   if(!silent) toast('환율을 불러오지 못했어요. 인터넷 연결을 확인하거나 직접 입력하세요.');
 }
 
+/* ---------- 환율 흐름 (그래프) ---------- */
+// 유럽중앙은행(ECB) 기준 환율 기록: 평일만, 하루 한 번 갱신
+// [['2026-10-02', 9.31], ...] 처럼 [날짜, 1엔당 원] 모양으로 이 폰에 저장
+const HIST_KEY = KEY + ':hist';
+// 관련 뉴스: 구글 뉴스 '엔화 환율' 검색 주소 (한글은 주소에 넣을 수 있게 변환)
+const NEWS_URL = 'https://news.google.com/search?q=' + encodeURIComponent('엔화 환율') + '&hl=ko&gl=KR&ceid=KR:ko';
+let chartDays = 30;                       // 그래프 기간: 7, 30, 90일
+let histLoading = false, histFailed = false, histTried = 0;
+
+// 저장된 기록도, API 응답도 그대로 믿지 않고 모양을 검사해요
+function cleanHist(h){
+  if(!h || !Array.isArray(h.points)) return null;
+  const points = h.points
+    .filter(p => Array.isArray(p) && /^\d{4}-\d{2}-\d{2}$/.test(p[0]) && typeof p[1] === 'number' && p[1] > 0 && p[1] < 100)
+    .sort((a, b) => a[0] < b[0] ? -1 : 1);
+  return points.length ? {fetched:Number.isFinite(h.fetched) ? h.fetched : 0, points} : null;
+}
+let hist = null;
+try{ hist = cleanHist(JSON.parse(localStorage.getItem(HIST_KEY))); }catch(e){}
+
+const isoDay = d => d.toISOString().slice(0, 10);     // 2026-10-05 모양
+const histStale = () => !hist || Date.now() - hist.fetched > 6 * 3600e3;
+
+async function loadHistory(){
+  // 이미 불러오는 중이거나 1분 안에 시도했으면 건너뜀 (실패할 때 요청이 반복되지 않게)
+  if(histLoading || Date.now() - histTried < 60e3) return;
+  histLoading = true; histFailed = false; histTried = Date.now();
+  const start = isoDay(new Date(Date.now() - 100 * 864e5));   // 나중에 주간 표 계산까지 쓰려고 100일치
+  const urls = [`https://api.frankfurter.dev/v1/${start}..?from=JPY&to=KRW`,
+                `https://api.frankfurter.app/${start}..?from=JPY&to=KRW`];
+  let ok = false;
+  for(const url of urls){
+    try{
+      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+      const res = await fetch(url, {signal:ctl.signal, cache:'no-store'});
+      clearTimeout(tm);
+      if(!res.ok) continue;
+      const d = await res.json();
+      // 응답 모양: {rates: {'2026-10-02': {KRW: 9.31}, ...}}
+      const h = cleanHist({fetched:Date.now(), points:Object.entries(d.rates || {}).map(([day, r]) => [day, r && r.KRW])});
+      if(!h) continue;
+      hist = h; ok = true;
+      try{ localStorage.setItem(HIST_KEY, JSON.stringify(hist)); }catch(e){}
+      break;
+    }catch(e){}
+  }
+  histLoading = false; histFailed = !ok;
+  updateChart();
+}
+// 화면 전체 대신 환율 기록을 쓰는 칸만 다시 그림 (계산기에 입력 중인 숫자가 지워지지 않게)
+function updateChart(){
+  const box = $('#chartBox'); if(box) box.innerHTML = chartInner();
+  const wk = $('#weekBox');   if(wk)  wk.innerHTML  = weekInner();
+  const vol = $('#volBox');   if(vol) vol.innerHTML = volInner();
+}
+
+function chartInner(){
+  const btns = [[7,'1주일'], [30,'1개월'], [90,'3개월']].map(([d, t]) =>
+    `<button data-act="chartDays" data-v="${d}" class="${chartDays === d ? 'on' : ''}" aria-pressed="${chartDays === d}">${t}</button>`).join('');
+  const h = `<div class="seg full" role="group" aria-label="그래프 기간">${btns}</div>`;
+  if(!hist){
+    const msg = !navigator.onLine ? '인터넷에 연결되면 환율 기록을 불러와요.'
+              : histFailed ? '환율 기록을 불러오지 못했어요. 잠시 뒤 환율 탭을 다시 열어 보세요.'
+              : '환율 기록을 불러오는 중…';
+    return h + `<p class="hint">${msg}</p>`;
+  }
+  // 마지막 기록 날짜부터 거꾸로 기간만큼의 점만 고름
+  const lastDay = hist.points[hist.points.length - 1][0];
+  const from = isoDay(new Date(new Date(lastDay).getTime() - chartDays * 864e5));
+  const pts = hist.points.filter(p => p[0] > from);
+  if(pts.length < 2) return h + `<p class="hint">그래프를 그릴 만큼 기록이 없어요.</p>`;
+  return h + chartSVG(pts) + chartFoot(pts);
+}
+
+// SVG로 선 그래프 그리기: 값을 그림 좌표(x, y)로 바꿔서 점을 이어요
+function chartSVG(pts){
+  const W = 320, H = 150, L = 8, R = 8, T = 16, B = 22;     // 그림 크기와 위·아래·양옆 여백
+  const vals = pts.map(p => p[1] * 100);                     // 100엔당 원으로 표시
+  const hi = Math.max(...vals), lo = Math.min(...vals);
+  let max = hi, min = lo;
+  if(max - min < 0.5){ const mid = (max + min) / 2; max = mid + 0.25; min = mid - 0.25; }  // 거의 평평하면 여유를 둠
+  const x = i => L + i * (W - L - R) / (vals.length - 1);
+  const y = v => T + (max - v) * (H - T - B) / (max - min);  // 값이 클수록 위쪽 (SVG는 y가 아래로 커짐)
+  const xy = (v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+  const line = vals.map(xy).join(' ');
+  const area = `${L},${H - B} ${line} ${W - R},${H - B}`;
+  const md = s => `${+s.slice(5, 7)}/${+s.slice(8, 10)}`;   // '2026-10-05' → '10/5'
+  const n = vals.length - 1;
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="100엔당 원 환율 그래프, 최고 ${hi.toFixed(1)}원, 최저 ${lo.toFixed(1)}원">
+    <line class="gd" x1="${L}" x2="${W - R}" y1="${y(hi).toFixed(1)}" y2="${y(hi).toFixed(1)}"/>
+    <line class="gd" x1="${L}" x2="${W - R}" y1="${y(lo).toFixed(1)}" y2="${y(lo).toFixed(1)}"/>
+    <polygon class="ar" points="${area}"/>
+    <polyline class="ln" points="${line}"/>
+    <circle class="dot" cx="${x(n).toFixed(1)}" cy="${y(vals[n]).toFixed(1)}" r="4"/>
+    <text x="${L}" y="${(y(hi) - 4).toFixed(1)}">최고 ${hi.toFixed(1)}원</text>
+    <text x="${L}" y="${(y(lo) - 4).toFixed(1)}">최저 ${lo.toFixed(1)}원</text>
+    <text x="${L}" y="${H - 5}">${md(pts[0][0])}</text>
+    <text x="${W - R}" y="${H - 5}" text-anchor="end">${md(pts[n][0])}</text>
+  </svg>`;
+}
+
+// 그래프 아래 한 줄 요약: 기간 첫날 대비 마지막 날
+function chartFoot(pts){
+  const a = pts[0][1] * 100, b = pts[pts.length - 1][1] * 100;
+  const diff = b - a, pct = diff / a * 100;
+  const up = diff >= 0.05, down = diff <= -0.05;
+  const sign = up ? '+' : down ? '−' : '';
+  const word = up ? '올랐어요 (환전 불리)' : down ? '내렸어요 (환전 유리)' : '거의 그대로예요';
+  return `<p class="meta" style="margin-top:6px">이 기간 100엔당 <b class="${up ? 'up' : down ? 'down' : ''}">${sign}${Math.abs(diff).toFixed(1)}원 (${sign}${Math.abs(pct).toFixed(2)}%)</b> ${word}</p>
+    <p class="hint">ECB 기준 환율이라 평일만 있고, 위의 환율과 조금 다를 수 있어요. 마지막 기록 ${esc(pts[pts.length - 1][0])}</p>`;
+}
+
+/* ---------- 주간 등락표 (최근 4주) ---------- */
+// 날짜가 속한 주의 월요일 날짜 ('2026-10-02' → '2026-09-28')
+const mondayOf = day => {
+  const d = new Date(day + 'T00:00:00Z');
+  return isoDay(new Date(d.getTime() - ((d.getUTCDay() + 6) % 7) * 864e5));
+};
+// 기록을 주 단위로 묶고, 각 주의 마지막 환율(종가)을 지난주 종가와 비교
+function weeklyRows(){
+  const weeks = [];                         // [{mon, first, last, close}, ...] 오래된 주부터
+  hist.points.forEach(([day, v]) => {
+    const mon = mondayOf(day), w = weeks[weeks.length - 1];
+    if(w && w.mon === mon){ w.last = day; w.close = v; }
+    else weeks.push({mon, first:day, last:day, close:v});
+  });
+  const rows = [];
+  for(let i = weeks.length - 1; i >= 1 && rows.length < 4; i--){   // 최근 주부터 4개
+    const w = weeks[i], prev = weeks[i - 1];
+    rows.push({...w, diff:(w.close - prev.close) * 100, pct:(w.close - prev.close) / prev.close * 100});
+  }
+  return rows;
+}
+// 등락 표시: 오르면 빨강 ▲, 내리면 파랑 ▼ (0.05원 미만은 보합)
+function moveHTML(diff, pct){
+  if(Math.abs(diff) < 0.05) return '<span class="meta">변동 없음</span>';
+  const up = diff > 0;
+  return `<span class="${up ? 'up' : 'down'}">${up ? '▲' : '▼'} ${Math.abs(diff).toFixed(1)}원 (${Math.abs(pct).toFixed(2)}%)</span>`;
+}
+// 이번 주 월요일과 몇 주 차이인지로 이름 붙이기
+function weekName(thisMon, mon){
+  const n = Math.round((new Date(thisMon) - new Date(mon)) / (7 * 864e5));
+  return n <= 0 ? '이번 주' : n === 1 ? '지난주' : `${n}주 전`;
+}
+function weekInner(){
+  if(!hist) return '<p class="hint" style="margin:10px 0">환율 기록을 불러오면 여기에 나와요.</p>';
+  const rows = weeklyRows();
+  if(!rows.length) return '<p class="hint" style="margin:10px 0">비교할 만큼 기록이 없어요.</p>';
+  const md = s => `${+s.slice(5, 7)}/${+s.slice(8, 10)}`;
+  const thisMon = mondayOf(isoDay(new Date()));
+  return rows.map(r => `<div class="item">
+      <div><div>${weekName(thisMon, r.mon)}</div>
+        <div class="meta">${md(r.first)} ~ ${md(r.last)}</div></div>
+      <div class="wk-r"><div class="num">${(r.close * 100).toFixed(1)}원</div><div class="num" style="font-size:13px">${moveHTML(r.diff, r.pct)}</div></div>
+    </div>`).join('');
+}
+
+/* ---------- 변동 요약 ---------- */
+// 하루하루 몇 %씩 움직였는지의 평균 (최근 days일)
+function avgDailyMove(days){
+  const pts = hist.points, last = pts[pts.length - 1][0];
+  const from = isoDay(new Date(new Date(last).getTime() - days * 864e5));
+  const p = pts.filter(x => x[0] > from), moves = [];
+  for(let i = 1; i < p.length; i++) moves.push(Math.abs(p[i][1] / p[i - 1][1] - 1) * 100);
+  return moves.length ? moves.reduce((a, b) => a + b, 0) / moves.length : null;
+}
+function volInner(){
+  if(!hist) return '<p class="hint" style="margin-top:0">환율 기록을 불러오면 여기에 나와요.</p>';
+  const m30 = avgDailyMove(30), m90 = avgDailyMove(90);
+  const last = hist.points[hist.points.length - 1][0];
+  const from = isoDay(new Date(new Date(last).getTime() - 90 * 864e5));
+  const v90 = hist.points.filter(x => x[0] > from).map(x => x[1] * 100);
+  if(m30 === null || m90 === null || v90.length < 2) return '<p class="hint" style="margin-top:0">계산할 만큼 기록이 없어요.</p>';
+
+  const cur = v90[v90.length - 1], lo = Math.min(...v90), hi = Math.max(...v90);
+  const pos = hi > lo ? (cur - lo) / (hi - lo) * 100 : 50;          // 3개월 최저=0, 최고=100
+  // 최근 1개월이 3개월 평균보다 30% 넘게 크거나 작으면 알려 줌
+  const calm = m30 > m90 * 1.3 ? '평소(3개월 평균)보다 크게 출렁이는 중이에요.'
+             : m30 < m90 * 0.7 ? '평소(3개월 평균)보다 잠잠한 편이에요.' : '평소(3개월 평균)와 비슷하게 움직여요.';
+  const where = pos < 33 ? '낮은 편이에요. 환전하기 비교적 유리한 구간이에요.'
+              : pos > 66 ? '높은 편이에요. 환전하기 비교적 불리한 구간이에요.' : '중간쯤이에요.';
+  return `<div class="lbl" style="margin-top:0">하루 평균 움직임 (최근 1개월)</div>
+    <div class="num" style="font-size:20px;font-weight:700">±${m30.toFixed(2)}%</div>
+    <div class="meta">100엔당 하루 약 ${(cur * m30 / 100).toFixed(1)}원씩 오르내렸어요. ${calm}</div>
+    <div class="lbl">3개월 중 지금 위치</div>
+    <div class="pos-bar" role="img" aria-label="3개월 범위 중 ${Math.round(pos)}% 위치"><i style="left:${pos.toFixed(1)}%"></i></div>
+    <div class="between meta num"><span>최저 ${lo.toFixed(1)}원</span><span>최고 ${hi.toFixed(1)}원</span></div>
+    <p style="margin:8px 0 0">지금 ${cur.toFixed(1)}원은 3개월 중 ${where}</p>
+    <p class="hint">지난 기록으로 계산한 참고 정보예요. 앞으로 오를지 내릴지는 알 수 없어요.</p>`;
+}
+
 /* ---------- 공통 ---------- */
 function backupHTML(){
   return `<details class="backup"><summary>데이터 백업</summary>
@@ -835,6 +1053,7 @@ function render(){
   $('#main').innerHTML = (id === 'settle' ? settleHTML() : id === 'budget' ? budgetHTML() : fxHTML()) + backupHTML() + '<div class="made sig">made by sarangyee</div>';
   document.title = '도쿄 지갑 ' + TABS[tab].ko;
   hydratePhotos();
+  if(id === 'fx' && navigator.onLine && histStale()) loadHistory();   // 환율 탭을 열 때 기록이 6시간 지났으면 새로 받음
 }
 
 /* ---------- 동작 ---------- */
@@ -981,6 +1200,11 @@ const A = {
     const keep = $('#fxIn') ? $('#fxIn').value : '';
     fxDir = fxDir === 'J2K' ? 'K2J' : 'J2K'; render();
     $('#fxIn').value = keep; updateFx();
+  },
+  chartDays(b){
+    const v = +b.dataset.v;
+    if(![7, 30, 90].includes(v)) return;
+    chartDays = v; updateChart();
   },
   async exportData(){
     const txt = JSON.stringify(S);

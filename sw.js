@@ -1,5 +1,5 @@
 // 오프라인 사용을 위한 서비스 워커: 앱 파일을 폰에 저장해 두고, 인터넷이 없어도 열어 줘요.
-const CACHE = 'tokyo-wallet-v3';   // v2 → v3
+const CACHE = 'tokyo-wallet-v7';   // 앱을 고칠 때마다 숫자를 올려요
 const FILES = ['./', 'index.html', 'icon.png'];
 
 self.addEventListener('install', e => {
